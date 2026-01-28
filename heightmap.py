@@ -22,4 +22,5 @@ def export_final_map(bin_file, width=128, height=128):
     print("Export Complete: FINAL_CLEAN_HEIGHTMAP.png")
 
 if __name__ == "__main__":
-    export_final_map(r"C:\Users\istuart\Downloads\decompressed_assets\asset_00949B3C.bin")
+
+    export_final_map(r"\asset_00949B3C.bin")
