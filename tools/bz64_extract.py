@@ -52,6 +52,9 @@ class Tri:
     i2: int
 
 
+TexState = Tuple[int, int, int, int, int, int, int]
+
+
 def be32(b: bytes, off: int) -> int:
     return struct.unpack_from(">I", b, off)[0]
 
@@ -447,6 +450,201 @@ def parse_model(data: bytes, dl_off: int = 8, tri_div2: bool = True) -> Tuple[Li
     return all_verts, all_tris, stats
 
 
+def parse_model_with_texstates(
+    data: bytes,
+    dl_off: int = 8,
+    tri_div2: bool = True,
+) -> Tuple[List[Vtx], List[Tri], Dict[str, int], List[Optional[TexState]]]:
+    cmds = list(_iter_display_list_exec(data, dl_off=dl_off))
+    if not cmds:
+        raise ValueError("No display-list commands found")
+
+    all_verts: List[Vtx] = []
+    all_tris: List[Tri] = []
+    tri_states: List[Optional[TexState]] = []
+    vert_lut: Dict[Tuple[int, int, int, int, int, int, int, int, int], int] = {}
+    vtx_loads = 0
+    da_count = 0
+    de_count = 0
+    external_matrix_refs = 0
+    external_dl_refs = 0
+
+    cache: List[Optional[Vtx]] = [None] * 64
+    current_mtx: List[List[float]] = _mtx_identity()
+    mtx_stack: List[List[List[float]]] = []
+
+    current_pal: Optional[int] = None
+    current_img: Optional[int] = None
+    current_fmt: Optional[int] = None
+    current_siz: Optional[int] = None
+    current_pal_bank = 0
+    current_wh: Tuple[int, int] = (32, 32)
+
+    def _make_state() -> Optional[TexState]:
+        if current_img is None or current_fmt is None or current_siz is None:
+            return None
+        return (
+            -1 if current_pal is None else int(current_pal),
+            int(current_img),
+            int(current_wh[0]),
+            int(current_wh[1]),
+            int(current_fmt),
+            int(current_siz),
+            int(current_pal_bank),
+        )
+
+    for _, op, w0, w1 in cmds:
+        if op == 0xDA:  # G_MTX
+            da_count += 1
+            flags = w0 & 0xFF
+            if (flags & 0x03) == 0x03:
+                continue
+            mtx_off = _resolve_segment_offset(data, w1)
+            if mtx_off is None:
+                external_matrix_refs += 1
+                continue
+            try:
+                decoded = _decode_n64_mtx(data, mtx_off)
+            except Exception:
+                continue
+            if (w0 & 1) != 0:
+                mtx_stack.append(current_mtx)
+            current_mtx = decoded
+            continue
+
+        if op == 0xD8:  # POPMTX
+            if mtx_stack:
+                current_mtx = mtx_stack.pop()
+            continue
+
+        if op == 0xDE:  # G_DL
+            de_count += 1
+            if _resolve_segment_offset(data, w1) is None:
+                external_dl_refs += 1
+            continue
+
+        if op == 0xFD:  # G_SETTIMG
+            addr = _resolve_dl_addr(data, w1)
+            if addr is None:
+                continue
+            fmt = (w0 >> 21) & 0x7
+            siz = (w0 >> 19) & 0x3
+            if fmt == 0 and siz == 2 and (addr + 32) <= len(data):
+                current_pal = addr
+            else:
+                current_img = addr
+            continue
+
+        if op == 0xF5:  # G_SETTILE
+            tile = (w1 >> 24) & 0x7
+            if tile != 7:
+                current_fmt = (w0 >> 21) & 0x7
+                current_siz = (w0 >> 19) & 0x3
+                current_pal_bank = (w1 >> 20) & 0xF
+            continue
+
+        if op == 0xF2:  # G_SETTILESIZE
+            wh = _decode_settilesize_wh(w1)
+            if wh is not None:
+                current_wh = wh
+            continue
+
+        if op == 0x01:  # VTX
+            n = (w0 >> 12) & 0xFF
+            end = (w0 & 0x0FFF) >> 1
+            v0 = end - n
+            if n <= 0 or v0 < 0:
+                continue
+            voff = _resolve_segment_offset(data, w1)
+            if voff is None:
+                continue
+            block_verts = parse_vertices(data, voff, n)
+            for i, v in enumerate(block_verts):
+                slot = v0 + i
+                if 0 <= slot < len(cache):
+                    cache[slot] = v
+            vtx_loads += 1
+            continue
+
+        if op == 0x05:  # TRI1
+            if tri_div2:
+                a = ((w0 >> 16) & 0xFF) // 2
+                b = ((w0 >> 8) & 0xFF) // 2
+                c = (w0 & 0xFF) // 2
+            else:
+                a = (w0 >> 16) & 0xFF
+                b = (w0 >> 8) & 0xFF
+                c = w0 & 0xFF
+            if a >= len(cache) or b >= len(cache) or c >= len(cache):
+                continue
+            va = cache[a]
+            vb = cache[b]
+            vc = cache[c]
+            if va is None or vb is None or vc is None:
+                continue
+            tv = [_apply_mtx(va, current_mtx), _apply_mtx(vb, current_mtx), _apply_mtx(vc, current_mtx)]
+            idxs: List[int] = []
+            for vv in tv:
+                key = (vv.x, vv.y, vv.z, vv.s, vv.t, vv.r, vv.g, vv.b, vv.a)
+                gi = vert_lut.get(key)
+                if gi is None:
+                    gi = len(all_verts)
+                    all_verts.append(vv)
+                    vert_lut[key] = gi
+                idxs.append(gi)
+            all_tris.append(Tri(idxs[0], idxs[1], idxs[2]))
+            tri_states.append(_make_state())
+            continue
+
+        if op == 0x06:  # TRI2
+            if tri_div2:
+                a0 = ((w0 >> 16) & 0xFF) // 2
+                b0 = ((w0 >> 8) & 0xFF) // 2
+                c0 = (w0 & 0xFF) // 2
+                a1 = ((w1 >> 16) & 0xFF) // 2
+                b1 = ((w1 >> 8) & 0xFF) // 2
+                c1 = (w1 & 0xFF) // 2
+            else:
+                a0 = (w0 >> 16) & 0xFF
+                b0 = (w0 >> 8) & 0xFF
+                c0 = w0 & 0xFF
+                a1 = (w1 >> 16) & 0xFF
+                b1 = (w1 >> 8) & 0xFF
+                c1 = w1 & 0xFF
+            for a, b, c in ((a0, b0, c0), (a1, b1, c1)):
+                if a >= len(cache) or b >= len(cache) or c >= len(cache):
+                    continue
+                va = cache[a]
+                vb = cache[b]
+                vc = cache[c]
+                if va is None or vb is None or vc is None:
+                    continue
+                tv = [_apply_mtx(va, current_mtx), _apply_mtx(vb, current_mtx), _apply_mtx(vc, current_mtx)]
+                idxs: List[int] = []
+                for vv in tv:
+                    key = (vv.x, vv.y, vv.z, vv.s, vv.t, vv.r, vv.g, vv.b, vv.a)
+                    gi = vert_lut.get(key)
+                    if gi is None:
+                        gi = len(all_verts)
+                        all_verts.append(vv)
+                        vert_lut[key] = gi
+                    idxs.append(gi)
+                all_tris.append(Tri(idxs[0], idxs[1], idxs[2]))
+                tri_states.append(_make_state())
+            continue
+
+    stats: Dict[str, int] = {
+        "tri_count": len(all_tris),
+        "vert_count": len(all_verts),
+        "vtx_loads": vtx_loads,
+        "da_count": da_count,
+        "de_count": de_count,
+        "external_matrix_refs": external_matrix_refs,
+        "external_dl_refs": external_dl_refs,
+    }
+    return all_verts, all_tris, stats, tri_states
+
+
 def _mesh_topology_penalty(verts: Sequence[Vtx], tris: Sequence[Tri]) -> float:
     if not verts or not tris:
         return 1e9
@@ -551,6 +749,19 @@ def _compact_mesh(verts: Sequence[Vtx], tris: Sequence[Tri]) -> Tuple[List[Vtx],
     return out_verts, out_tris
 
 
+def _compact_mesh_with_states(
+    verts: Sequence[Vtx],
+    tris: Sequence[Tri],
+    tri_states: Sequence[Optional[TexState]],
+) -> Tuple[List[Vtx], List[Tri], List[Optional[TexState]]]:
+    used = sorted({i for t in tris for i in (t.i0, t.i1, t.i2)})
+    remap = {old: new for new, old in enumerate(used)}
+    out_verts = [verts[i] for i in used]
+    out_tris = [Tri(remap[t.i0], remap[t.i1], remap[t.i2]) for t in tris]
+    out_states = list(tri_states[: len(out_tris)])
+    return out_verts, out_tris, out_states
+
+
 def _prune_outlier_tris(verts: Sequence[Vtx], tris: Sequence[Tri], mode: str = "full") -> Tuple[List[Vtx], List[Tri], int]:
     if not verts or not tris:
         return list(verts), list(tris), 0
@@ -626,6 +837,92 @@ def _prune_outlier_tris(verts: Sequence[Vtx], tris: Sequence[Tri], mode: str = "
         return list(verts), list(tris), 0
     out_verts, out_tris = _compact_mesh(verts, kept)
     return out_verts, out_tris, removed
+
+
+def _prune_outlier_tris_with_states(
+    verts: Sequence[Vtx],
+    tris: Sequence[Tri],
+    tri_states: Sequence[Optional[TexState]],
+    mode: str = "full",
+) -> Tuple[List[Vtx], List[Tri], List[Optional[TexState]], int]:
+    if not verts or not tris:
+        return list(verts), list(tris), list(tri_states[: len(tris)]), 0
+    xs = [v.x for v in verts]
+    ys = [v.y for v in verts]
+    zs = [v.z for v in verts]
+    ex = float(max(xs) - min(xs))
+    ey = float(max(ys) - min(ys))
+    ez = float(max(zs) - min(zs))
+    diag = (ex * ex + ey * ey + ez * ez) ** 0.5
+    if diag <= 0.0:
+        return list(verts), list(tris), list(tri_states[: len(tris)]), 0
+
+    max_edges: List[float] = []
+    tri_areas: List[float] = []
+    tri_aspects: List[float] = []
+    tri_metrics: List[Tuple[int, Tri, float, float, float]] = []
+    for ti, t in enumerate(tris):
+        ids = [t.i0, t.i1, t.i2]
+        edges: List[float] = []
+        pts = [verts[ids[0]], verts[ids[1]], verts[ids[2]]]
+        for i, j in ((0, 1), (1, 2), (2, 0)):
+            a = verts[ids[i]]
+            b = verts[ids[j]]
+            dx = float(a.x - b.x)
+            dy = float(a.y - b.y)
+            dz = float(a.z - b.z)
+            edges.append((dx * dx + dy * dy + dz * dz) ** 0.5)
+        me = max(edges)
+        mine = max(1e-6, min(edges))
+        aspect = me / mine
+        ux = float(pts[1].x - pts[0].x)
+        uy = float(pts[1].y - pts[0].y)
+        uz = float(pts[1].z - pts[0].z)
+        vx = float(pts[2].x - pts[0].x)
+        vy = float(pts[2].y - pts[0].y)
+        vz = float(pts[2].z - pts[0].z)
+        cx = (uy * vz) - (uz * vy)
+        cy = (uz * vx) - (ux * vz)
+        cz = (ux * vy) - (uy * vx)
+        area = 0.5 * ((cx * cx + cy * cy + cz * cz) ** 0.5)
+        max_edges.append(me)
+        tri_areas.append(area)
+        tri_aspects.append(aspect)
+        tri_metrics.append((ti, t, me, area, aspect))
+
+    if not max_edges:
+        return list(verts), list(tris), list(tri_states[: len(tris)]), 0
+    if mode == "degenerate":
+        keep_ids = [ti for (ti, _t, _me, area, aspect) in tri_metrics if area > 1e-4 and aspect < 1e6]
+        removed = len(tris) - len(keep_ids)
+        if removed <= 0:
+            return list(verts), list(tris), list(tri_states[: len(tris)]), 0
+        kept_tris = [tris[i] for i in keep_ids]
+        kept_states = [tri_states[i] if i < len(tri_states) else None for i in keep_ids]
+        out_verts, out_tris, out_states = _compact_mesh_with_states(verts, kept_tris, kept_states)
+        return out_verts, out_tris, out_states, removed
+
+    se = sorted(max_edges)
+    sa = sorted(tri_areas)
+    ss = sorted(tri_aspects)
+    med_e = statistics.median(max_edges)
+    med_a = statistics.median(tri_areas)
+    p95_e = se[min(len(se) - 1, int(0.95 * len(se)))]
+    p98_a = sa[min(len(sa) - 1, int(0.98 * len(sa)))]
+    p95_s = ss[min(len(ss) - 1, int(0.95 * len(ss)))]
+    edge_thresh = min(0.70 * diag, max(3.5 * med_e, 1.4 * p95_e))
+    area_thresh = max(8.0 * med_a, 1.25 * p98_a)
+    aspect_thresh = max(14.0, 1.4 * p95_s)
+    keep_ids = [ti for (ti, _t, me, area, aspect) in tri_metrics if (me <= edge_thresh and area <= area_thresh and aspect <= aspect_thresh)]
+    if len(keep_ids) < max(1, len(tris) // 3):
+        return list(verts), list(tris), list(tri_states[: len(tris)]), 0
+    removed = len(tris) - len(keep_ids)
+    if removed <= 0:
+        return list(verts), list(tris), list(tri_states[: len(tris)]), 0
+    kept_tris = [tris[i] for i in keep_ids]
+    kept_states = [tri_states[i] if i < len(tri_states) else None for i in keep_ids]
+    out_verts, out_tris, out_states = _compact_mesh_with_states(verts, kept_tris, kept_states)
+    return out_verts, out_tris, out_states, removed
 
 
 def rgba5551_to_rgba8888(v: int) -> Tuple[int, int, int, int]:
@@ -964,11 +1261,71 @@ def extract_ci4_texture_from_dl(data: bytes, dl_off: int) -> Tuple[List[Tuple[in
     raise ValueError("failed to decode texture from inferred DL state")
 
 
+def _build_materials_from_tri_states(
+    data: bytes,
+    out_base: pathlib.Path,
+    tri_states: Sequence[Optional[TexState]],
+) -> Tuple[Optional[List[str]], Optional[Dict[str, str]], int]:
+    if Image is None:
+        return None, None, 0
+    usage: Dict[TexState, int] = {}
+    for st in tri_states:
+        if st is None:
+            continue
+        usage[st] = usage.get(st, 0) + 1
+    if not usage:
+        return None, None, 0
+
+    ordered = sorted(
+        usage.items(),
+        key=lambda kv: (
+            int(kv[1]),
+            _texture_state_pref_score(int(kv[0][4]), int(kv[0][5])),
+            -int(kv[0][6]),
+            -int(kv[0][2] * kv[0][3]),
+        ),
+        reverse=True,
+    )
+
+    mat_tex: Dict[str, str] = {}
+    state_to_mat: Dict[TexState, str] = {}
+    for i, (st, _hits) in enumerate(ordered):
+        pal, img, w, h, fmt, siz, pal_bank = st
+        try:
+            pixels = _decode_texture_pixels(
+                data=data,
+                fmt=fmt,
+                siz=siz,
+                img_off=img,
+                width=w,
+                height=h,
+                pal_off=None if pal < 0 else pal,
+                pal_bank=pal_bank,
+            )
+        except Exception:
+            continue
+        mat_name = f"mat{i:02d}"
+        tex_name = f"{out_base.stem}_tex{i:02d}.png"
+        img_out = Image.new("RGBA", (w, h))
+        img_out.putdata(pixels)
+        img_out.save(out_base.with_name(f"{out_base.stem}_tex{i:02d}.png"))
+        mat_tex[mat_name] = tex_name
+        state_to_mat[st] = mat_name
+
+    if not mat_tex:
+        return None, None, 0
+    default_mat = next(iter(mat_tex.keys()))
+    tri_mats = [state_to_mat.get(st, default_mat) if st is not None else default_mat for st in tri_states]
+    return tri_mats, mat_tex, len(mat_tex)
+
+
 def write_obj_mtl(
     out_base: pathlib.Path,
     verts: Sequence[Vtx],
     tris: Sequence[Tri],
     with_texture: bool,
+    tri_materials: Optional[Sequence[str]] = None,
+    material_textures: Optional[Dict[str, str]] = None,
 ) -> None:
     obj_path = out_base.with_suffix(".obj")
     mtl_path = out_base.with_suffix(".mtl")
@@ -977,7 +1334,8 @@ def write_obj_mtl(
     with obj_path.open("w", encoding="utf-8", newline="\n") as f:
         if with_texture:
             f.write(f"mtllib {mtl_path.name}\n")
-            f.write("usemtl mat0\n")
+            if not tri_materials:
+                f.write("usemtl mat0\n")
         for v in verts:
             f.write(f"v {v.x} {v.y} {v.z}\n")
         # UV scaling observed in sample: 10.2 fixed-ish style with 4096 tile range.
@@ -985,7 +1343,13 @@ def write_obj_mtl(
             u = v.s / 4096.0
             vv = 1.0 - (v.t / 4096.0)
             f.write(f"vt {u:.6f} {vv:.6f}\n")
-        for t in tris:
+        current_mtl: Optional[str] = None
+        for ti, t in enumerate(tris):
+            if with_texture and tri_materials and ti < len(tri_materials):
+                mtl = tri_materials[ti]
+                if mtl != current_mtl:
+                    f.write(f"usemtl {mtl}\n")
+                    current_mtl = mtl
             # OBJ is 1-based.
             a = t.i0 + 1
             b = t.i1 + 1
@@ -994,13 +1358,23 @@ def write_obj_mtl(
 
     if with_texture:
         with mtl_path.open("w", encoding="utf-8", newline="\n") as f:
-            f.write("newmtl mat0\n")
-            f.write("Ka 1.0 1.0 1.0\n")
-            f.write("Kd 1.0 1.0 1.0\n")
-            f.write("Ks 0.0 0.0 0.0\n")
-            f.write("d 1.0\n")
-            f.write("illum 1\n")
-            f.write(f"map_Kd {tex_name}\n")
+            if material_textures:
+                for mat, tex in material_textures.items():
+                    f.write(f"newmtl {mat}\n")
+                    f.write("Ka 1.0 1.0 1.0\n")
+                    f.write("Kd 1.0 1.0 1.0\n")
+                    f.write("Ks 0.0 0.0 0.0\n")
+                    f.write("d 1.0\n")
+                    f.write("illum 1\n")
+                    f.write(f"map_Kd {tex}\n\n")
+            else:
+                f.write("newmtl mat0\n")
+                f.write("Ka 1.0 1.0 1.0\n")
+                f.write("Kd 1.0 1.0 1.0\n")
+                f.write("Ks 0.0 0.0 0.0\n")
+                f.write("d 1.0\n")
+                f.write("illum 1\n")
+                f.write(f"map_Kd {tex_name}\n")
 
 
 def cmd_scan(args: argparse.Namespace) -> int:
@@ -1017,27 +1391,57 @@ def cmd_export_model(args: argparse.Namespace) -> int:
     out_base = pathlib.Path(args.out)
     out_base.parent.mkdir(parents=True, exist_ok=True)
 
-    verts, tris, stats = parse_model(blob)
+    tri_states: List[Optional[TexState]] = []
+    if args.texture:
+        verts, tris, stats, tri_states = parse_model_with_texstates(blob)
+    else:
+        verts, tris, stats = parse_model(blob)
     pruned_tris = 0
     if args.strict_mesh:
-        verts, tris, pruned_tris = _prune_outlier_tris(verts, tris)
+        if tri_states:
+            verts, tris, tri_states, pruned_tris = _prune_outlier_tris_with_states(verts, tris, tri_states)
+        else:
+            verts, tris, pruned_tris = _prune_outlier_tris(verts, tris)
         if not mesh_quality_strict_ok(verts, tris):
             raise ValueError("strict mesh checks failed for this model")
     wrote_texture = False
+    tri_mats: Optional[List[str]] = None
+    mat_tex: Optional[Dict[str, str]] = None
+    texture_materials = 0
     if args.texture:
         if Image is None:
             raise RuntimeError("Pillow is required for PNG texture export: pip install pillow")
         try:
-            pixels, w, h = extract_ci4_texture_from_dl(blob, dl_off=8)
+            tri_mats, mat_tex, texture_materials = _build_materials_from_tri_states(blob, out_base, tri_states)
+            if tri_mats and mat_tex:
+                wrote_texture = True
+            else:
+                try:
+                    pixels, w, h = extract_ci4_texture_from_dl(blob, dl_off=8)
+                except Exception:
+                    pixels, w, h = extract_ci4_texture(blob)
+                img = Image.new("RGBA", (w, h))
+                img.putdata(pixels)
+                img.save(out_base.with_suffix(".png"))
+                wrote_texture = True
         except Exception:
-            pixels, w, h = extract_ci4_texture(blob)
-        img = Image.new("RGBA", (w, h))
-        img.putdata(pixels)
-        img.save(out_base.with_suffix(".png"))
-        wrote_texture = True
+            wrote_texture = False
 
-    write_obj_mtl(out_base, verts, tris, with_texture=wrote_texture)
-    print(json.dumps({"out": str(out_base), **stats, "tri_count": len(tris), "vert_count": len(verts), "pruned_outlier_tris": pruned_tris, "texture": wrote_texture}, indent=2))
+    write_obj_mtl(out_base, verts, tris, with_texture=wrote_texture, tri_materials=tri_mats, material_textures=mat_tex)
+    print(
+        json.dumps(
+            {
+                "out": str(out_base),
+                **stats,
+                "tri_count": len(tris),
+                "vert_count": len(verts),
+                "pruned_outlier_tris": pruned_tris,
+                "texture": wrote_texture,
+                "texture_materials": texture_materials,
+            },
+            indent=2,
+        )
+    )
     return 0
 
 
@@ -1163,13 +1567,25 @@ def _export_one_model(
                 best = div2_alt
 
     verts, tris, stats, dl_used, base_used, tri_mode_used, _pen_used, _long_used = best
+    tri_states: List[Optional[TexState]] = []
+    if texture:
+        try:
+            chunk_tex = rom[base_used : base_used + window + 16]
+            v2, t2, _s2, ts2 = parse_model_with_texstates(chunk_tex, dl_off=dl_used, tri_div2=(tri_mode_used == "div2"))
+            if len(v2) == len(verts) and len(t2) == len(tris):
+                tri_states = ts2
+        except Exception:
+            tri_states = []
     if stats["tri_count"] <= 0 or stats["vert_count"] <= 0:
         return None
 
     pruned_tris = 0
     if strict_mesh:
         if not disable_prune:
-            verts, tris, pruned_tris = _prune_outlier_tris(verts, tris, mode=prune_mode)
+            if tri_states:
+                verts, tris, tri_states, pruned_tris = _prune_outlier_tris_with_states(verts, tris, tri_states, mode=prune_mode)
+            else:
+                verts, tris, pruned_tris = _prune_outlier_tris(verts, tris, mode=prune_mode)
         stats["tri_count"] = len(tris)
         stats["vert_count"] = len(verts)
         if stats["tri_count"] <= 0 or stats["vert_count"] <= 0:
@@ -1184,27 +1600,39 @@ def _export_one_model(
         return None
 
     wrote_texture = False
+    tri_mats: Optional[List[str]] = None
+    mat_tex: Optional[Dict[str, str]] = None
+    texture_materials = 0
     if texture and Image is not None:
         try:
             chunk_tex = rom[base_used : base_used + window + 16]
-            try:
-                pixels, w, h = extract_ci4_texture_from_dl(chunk_tex, dl_off=dl_used)
-            except Exception:
-                pixels, w, h = extract_ci4_texture(chunk_tex)
-            img = Image.new("RGBA", (w, h))
-            img.putdata(pixels)
-            img.save(out_base.with_suffix(".png"))
-            wrote_texture = True
+            if tri_states:
+                tri_mats, mat_tex, texture_materials = _build_materials_from_tri_states(chunk_tex, out_base, tri_states)
+            if tri_mats and mat_tex:
+                wrote_texture = True
+            else:
+                try:
+                    pixels, w, h = extract_ci4_texture_from_dl(chunk_tex, dl_off=dl_used)
+                except Exception:
+                    pixels, w, h = extract_ci4_texture(chunk_tex)
+                img = Image.new("RGBA", (w, h))
+                img.putdata(pixels)
+                img.save(out_base.with_suffix(".png"))
+                wrote_texture = True
         except Exception:
             wrote_texture = False
 
-    write_obj_mtl(out_base, verts, tris, with_texture=wrote_texture)
+    write_obj_mtl(out_base, verts, tris, with_texture=wrote_texture, tri_materials=tri_mats, material_textures=mat_tex)
     return {
         "rom_offset": rom_off,
         "name": out_base.name,
         "obj": str(out_base.with_suffix(".obj")),
         "mtl": str(out_base.with_suffix(".mtl")) if wrote_texture else None,
-        "png": str(out_base.with_suffix(".png")) if wrote_texture else None,
+        "png": (
+            str(out_base.with_suffix(".png"))
+            if (wrote_texture and texture_materials == 0)
+            else (str(out_base.with_name(f"{out_base.stem}_tex00.png")) if texture_materials > 0 else None)
+        ),
         "tri_count": stats["tri_count"],
         "vert_count": stats["vert_count"],
         "da_count": stats.get("da_count", 0),
@@ -1215,6 +1643,7 @@ def _export_one_model(
         "dl_offset_used": dl_used,
         "base_offset_used": base_used,
         "tri_index_mode": tri_mode_used,
+        "texture_materials": texture_materials,
         "bbox": _bbox(verts),
     }
 
