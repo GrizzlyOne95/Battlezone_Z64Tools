@@ -692,6 +692,162 @@ def _decode_settilesize_wh(w1: int) -> Optional[Tuple[int, int]]:
     return width, height
 
 
+def _decode_rgba16_pixels(data: bytes, img_off: int, width: int, height: int) -> List[Tuple[int, int, int, int]]:
+    need = width * height * 2
+    if img_off < 0 or (img_off + need) > len(data):
+        raise ValueError("RGBA16 image out of range")
+    out: List[Tuple[int, int, int, int]] = []
+    blob = data[img_off : img_off + need]
+    for i in range(0, len(blob), 2):
+        v = (blob[i] << 8) | blob[i + 1]
+        out.append(rgba5551_to_rgba8888(v))
+    return out
+
+
+def _decode_i_pixels(data: bytes, img_off: int, width: int, height: int, siz: int) -> List[Tuple[int, int, int, int]]:
+    n = width * height
+    if siz == 0:  # I4
+        need = (n + 1) // 2
+        if img_off < 0 or (img_off + need) > len(data):
+            raise ValueError("I4 image out of range")
+        out: List[Tuple[int, int, int, int]] = []
+        for b in data[img_off : img_off + need]:
+            hi = (b >> 4) & 0xF
+            lo = b & 0xF
+            i0 = hi * 17
+            i1 = lo * 17
+            out.append((i0, i0, i0, 255))
+            out.append((i1, i1, i1, 255))
+        return out[:n]
+    if siz == 1:  # I8
+        need = n
+        if img_off < 0 or (img_off + need) > len(data):
+            raise ValueError("I8 image out of range")
+        out = []
+        for b in data[img_off : img_off + need]:
+            out.append((b, b, b, 255))
+        return out
+    raise ValueError("unsupported I size")
+
+
+def _decode_ia_pixels(data: bytes, img_off: int, width: int, height: int, siz: int) -> List[Tuple[int, int, int, int]]:
+    n = width * height
+    out: List[Tuple[int, int, int, int]] = []
+    if siz == 0:  # IA4: 3-bit intensity + 1-bit alpha per texel
+        need = (n + 1) // 2
+        if img_off < 0 or (img_off + need) > len(data):
+            raise ValueError("IA4 image out of range")
+        for b in data[img_off : img_off + need]:
+            for v in ((b >> 4) & 0xF, b & 0xF):
+                i = ((v >> 1) & 0x7) * 255 // 7
+                a = 255 if (v & 1) else 0
+                out.append((i, i, i, a))
+        return out[:n]
+    if siz == 1:  # IA8: 4-bit intensity + 4-bit alpha
+        need = n
+        if img_off < 0 or (img_off + need) > len(data):
+            raise ValueError("IA8 image out of range")
+        for b in data[img_off : img_off + need]:
+            i = ((b >> 4) & 0xF) * 17
+            a = (b & 0xF) * 17
+            out.append((i, i, i, a))
+        return out
+    if siz == 2:  # IA16: 8-bit intensity + 8-bit alpha
+        need = n * 2
+        if img_off < 0 or (img_off + need) > len(data):
+            raise ValueError("IA16 image out of range")
+        blob = data[img_off : img_off + need]
+        for i in range(0, len(blob), 2):
+            inten = blob[i]
+            alpha = blob[i + 1]
+            out.append((inten, inten, inten, alpha))
+        return out
+    raise ValueError("unsupported IA size")
+
+
+def _decode_ci_pixels(
+    data: bytes,
+    pal_off: int,
+    img_off: int,
+    width: int,
+    height: int,
+    siz: int,
+    pal_bank: int = 0,
+) -> List[Tuple[int, int, int, int]]:
+    n = width * height
+    if siz == 0:  # CI4
+        # If multiple 16-color banks are packed contiguously, select by pal_bank.
+        bank_off = pal_off + (max(0, pal_bank) * 32)
+        if (bank_off + 32) > len(data):
+            bank_off = pal_off
+        palette: List[Tuple[int, int, int, int]] = []
+        for i in range(16):
+            p = be32(b"\x00\x00" + data[bank_off + i * 2 : bank_off + i * 2 + 2], 0) & 0xFFFF
+            palette.append(rgba5551_to_rgba8888(p))
+        need = (n + 1) // 2
+        if img_off < 0 or (img_off + need) > len(data):
+            raise ValueError("CI4 image out of range")
+        out: List[Tuple[int, int, int, int]] = []
+        for b in data[img_off : img_off + need]:
+            out.append(palette[(b >> 4) & 0xF])
+            out.append(palette[b & 0xF])
+        return out[:n]
+    if siz == 1:  # CI8
+        # Assume 256 RGBA16 entries.
+        if pal_off < 0 or (pal_off + 512) > len(data):
+            raise ValueError("CI8 palette out of range")
+        palette: List[Tuple[int, int, int, int]] = []
+        for i in range(256):
+            p = be32(b"\x00\x00" + data[pal_off + i * 2 : pal_off + i * 2 + 2], 0) & 0xFFFF
+            palette.append(rgba5551_to_rgba8888(p))
+        need = n
+        if img_off < 0 or (img_off + need) > len(data):
+            raise ValueError("CI8 image out of range")
+        out = []
+        for idx in data[img_off : img_off + need]:
+            out.append(palette[idx])
+        return out
+    raise ValueError("unsupported CI size")
+
+
+def _decode_texture_pixels(
+    data: bytes,
+    fmt: int,
+    siz: int,
+    img_off: int,
+    width: int,
+    height: int,
+    pal_off: Optional[int] = None,
+    pal_bank: int = 0,
+) -> List[Tuple[int, int, int, int]]:
+    if fmt == 2:  # CI
+        if pal_off is None:
+            raise ValueError("CI decode requires palette")
+        return _decode_ci_pixels(data, pal_off, img_off, width, height, siz, pal_bank=pal_bank)
+    if fmt == 4:  # I
+        return _decode_i_pixels(data, img_off, width, height, siz)
+    if fmt == 3:  # IA
+        return _decode_ia_pixels(data, img_off, width, height, siz)
+    if fmt == 0 and siz == 2:  # RGBA16
+        return _decode_rgba16_pixels(data, img_off, width, height)
+    raise ValueError("unsupported texture format")
+
+
+def _texture_state_pref_score(fmt: int, siz: int) -> int:
+    # Prefer paletted/colored states first for single-texture OBJ export.
+    if fmt == 2 and siz == 0:  # CI4
+        return 6
+    if fmt == 2 and siz == 1:  # CI8
+        return 5
+    if fmt == 0 and siz == 2:  # RGBA16
+        return 4
+    if fmt == 3:  # IA*
+        return 3
+    if fmt == 4:  # I*
+        return 2
+    return 1
+
+
 def extract_ci4_texture_from_dl(data: bytes, dl_off: int) -> Tuple[List[Tuple[int, int, int, int]], int, int]:
     # Heuristic decode from RDP command stream:
     # - FD100000 commonly points to RGBA16 TLUT (16 entries)
@@ -702,20 +858,33 @@ def extract_ci4_texture_from_dl(data: bytes, dl_off: int) -> Tuple[List[Tuple[in
     current_pal: Optional[int] = None
     current_img: Optional[int] = None
     current_wh: Optional[Tuple[int, int]] = None
-    usage: Dict[Tuple[int, int, int, int], int] = {}
+    current_fmt: Optional[int] = None
+    current_siz: Optional[int] = None
+    current_pal_bank: int = 0
+    usage: Dict[Tuple[int, int, int, int, int, int, int], int] = {}
 
     for _off, op, w0, w1 in cmds:
         if op == 0xFD:
             addr = _resolve_dl_addr(data, w1)
             if addr is None:
                 continue
-            key = (w0 >> 20) & 0xF
-            if key == 0x1 and (addr + 32) <= len(data):
+            fmt = (w0 >> 21) & 0x7
+            siz = (w0 >> 19) & 0x3
+            if fmt == 0 and siz == 2 and (addr + 32) <= len(data):
                 pal_offs.append(addr)
                 current_pal = addr
-            elif key in (0x5, 0x9) and (addr + 32) <= len(data):
+            else:
                 img_offs.append(addr)
                 current_img = addr
+            continue
+
+        if op == 0xF5:
+            # Track render-tile fmt/siz/palette bank. Tile 7 is often load tile.
+            tile = (w1 >> 24) & 0x7
+            if tile != 7:
+                current_fmt = (w0 >> 21) & 0x7
+                current_siz = (w0 >> 19) & 0x3
+                current_pal_bank = (w1 >> 20) & 0xF
             continue
 
         if op == 0xF2:
@@ -726,50 +895,73 @@ def extract_ci4_texture_from_dl(data: bytes, dl_off: int) -> Tuple[List[Tuple[in
 
         if op in (0x05, 0x06):
             if current_pal is None or current_img is None:
+                # Non-CI formats may not require a palette.
+                if current_img is None:
+                    continue
+            if current_fmt is None or current_siz is None:
                 continue
             width, height = current_wh if current_wh is not None else (32, 32)
-            # CI4 image payload must fit in current blob.
-            bytes_needed = (width * height + 1) // 2
-            if width <= 0 or height <= 0 or (current_img + bytes_needed) > len(data):
+            if width <= 0 or height <= 0:
                 continue
             tri_inc = 2 if op == 0x06 else 1
-            key = (current_pal, current_img, width, height)
+            key = (
+                -1 if current_pal is None else current_pal,
+                current_img,
+                width,
+                height,
+                current_fmt,
+                current_siz,
+                current_pal_bank,
+            )
             usage[key] = usage.get(key, 0) + tri_inc
 
-    if not pal_offs or not img_offs:
-        raise ValueError("no CI4 palette/image addresses inferred from DL")
+    if not img_offs:
+        raise ValueError("no texture image addresses inferred from DL")
 
     candidate_dims: List[Tuple[int, int]] = [(32, 32), (16, 16), (64, 32), (32, 64), (64, 64), (128, 128)]
 
-    candidates: List[Tuple[int, int, int, int, int]] = []
+    candidates: List[Tuple[int, int, int, int, int, int, int, int]] = []
     if usage:
         # Prefer state pair that was active for most drawn triangles.
-        for (pal, img, width, height), tri_hits in usage.items():
-            candidates.append((tri_hits, pal, img, width, height))
-        candidates.sort(reverse=True)
+        for (pal, img, width, height, fmt, siz, pal_bank), tri_hits in usage.items():
+            candidates.append((tri_hits, pal, img, width, height, fmt, siz, pal_bank))
+        candidates.sort(
+            key=lambda c: (
+                int(c[0]),  # tri hits
+                _texture_state_pref_score(int(c[5]), int(c[6])),  # format preference
+                -int(c[7]),  # lower palette bank as tie-breaker
+                -int(c[3] * c[4]),  # smaller tile area preferred for tiny tiled assets
+            ),
+            reverse=True,
+        )
     else:
         # Fallback to most recent palette/image pair; this tends to reflect
         # final bound state in compact model display lists.
-        pal = pal_offs[-1]
+        pal = pal_offs[-1] if pal_offs else -1
         img = img_offs[-1]
         for width, height in candidate_dims:
-            candidates.append((0, pal, img, width, height))
+            candidates.append((0, pal, img, width, height, 2, 0, 0))
 
     # Try best-ranked pair first, then alternate dimensions if needed.
-    for _hits, pal, img, width, height in candidates:
+    for _hits, pal, img, width, height, fmt, siz, pal_bank in candidates:
         trial_dims = [(width, height)] + [d for d in candidate_dims if d != (width, height)]
         for tw, th in trial_dims:
-            bytes_needed = (tw * th + 1) // 2
-            if (img + bytes_needed) > len(data):
-                continue
-            if (pal + 32) > len(data):
-                continue
             try:
-                return _extract_ci4_texture_at(data, pal, img, tw, th)
+                pixels = _decode_texture_pixels(
+                    data=data,
+                    fmt=fmt,
+                    siz=siz,
+                    img_off=img,
+                    width=tw,
+                    height=th,
+                    pal_off=None if pal < 0 else pal,
+                    pal_bank=pal_bank,
+                )
+                return pixels, tw, th
             except Exception:
                 continue
 
-    raise ValueError("failed to decode CI4 texture from inferred DL palette/image state")
+    raise ValueError("failed to decode texture from inferred DL state")
 
 
 def write_obj_mtl(
@@ -1313,12 +1505,15 @@ def cmd_terrain_cluster(args: argparse.Namespace) -> int:
             n = 128 * 128
             hi = [dec[i * 2] for i in range(n)]
             lo = [dec[i * 2 + 1] for i in range(n)]
-            vals = [struct.unpack_from(">H", dec, i * 2)[0] for i in range(n)]
-            mn, mx = min(vals), max(vals)
+            be = [struct.unpack_from(">H", dec, i * 2)[0] for i in range(n)]
+            le = [struct.unpack_from("<H", dec, i * 2)[0] for i in range(n)]
+            
+            # Normalize for u16norm output (consistent with before but now explicitly BE)
+            mn, mx = min(be), max(be)
             rng = max(1, mx - mn)
-            norm = [int((v - mn) * 255 / rng) for v in vals]
+            norm = [int((v - mn) * 255 / rng) for v in be]
 
-            for suffix, data in [("hi", hi), ("lo", lo), ("u16norm", norm)]:
+            for suffix, data in [("hi", hi), ("lo", lo), ("be", hi), ("u16norm", norm)]:
                 img = Image.new("L", (128, 128))
                 img.putdata(data)
                 p = out_dir / f"{off:08X}_{suffix}.png"
