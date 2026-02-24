@@ -1,4 +1,7 @@
-# Battlezone 64 Extraction Notes (Agent Handoff)
+# Open Source WIP Battlezone64 ROM Extraction Tool
+
+<img width="1222" height="932" alt="image" src="https://github.com/user-attachments/assets/537bc20d-6f6d-4fbd-97b2-8d7ea5fadc13" />
+
 
 This repository contains active reverse-engineering tooling and outputs for:
 - **Battlezone - Rise of the Black Dogs (N64)**
